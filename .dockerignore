@@ -1,0 +1,57 @@
+# Git & Repository metadata
+.git
+.gitignore
+.gitattributes
+
+# Python byte code, caches, and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+nosetests.xml
+coverage.xml
+
+# Python Virtual Environments (do not copy host virtualenv into Linux container)
+venv/
+.venv/
+ENV/
+env/
+
+# Environment Variables & Secrets (prevent baking credentials into images)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+
+# Docker & Container artifacts
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+pgdata/
+redisdata/
+
+# IDE & Editor configurations
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary, build, and documentation artifacts
+build/
+dist/
+*.egg-info/
+*.log
+logs/
+*.tmp
+*.docx
+*.pdf
+*.png
+*.jpg
+*.jpeg
