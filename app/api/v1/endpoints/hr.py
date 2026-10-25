@@ -387,7 +387,14 @@ async def submit_self_evaluation(
     Self-Appraisal: Only the reviewee can submit their self-score and notes.
     Locked if review is already finalized.
     """
-    stmt = select(PerformanceReview).where(PerformanceReview.id == review_id)
+    stmt = (
+        select(PerformanceReview)
+        .options(
+            selectinload(PerformanceReview.reviewee),
+            selectinload(PerformanceReview.reviewer),
+        )
+        .where(PerformanceReview.id == review_id)
+    )
     res = await db.execute(stmt)
     review = res.scalar_one_or_none()
     if not review:
@@ -405,8 +412,18 @@ async def submit_self_evaluation(
     review.self_score = payload.self_score
     review.self_notes = payload.self_notes
     await db.commit()
-    await db.refresh(review)
-    return review
+
+    # Re-fetch with relationships eagerly loaded to prevent MissingGreenlet in response serialization
+    reload_stmt = (
+        select(PerformanceReview)
+        .options(
+            selectinload(PerformanceReview.reviewee),
+            selectinload(PerformanceReview.reviewer),
+        )
+        .where(PerformanceReview.id == review_id)
+    )
+    reloaded = (await db.execute(reload_stmt)).scalar_one()
+    return reloaded
 
 
 @router.patch("/reviews/{review_id}/manager", response_model=PerformanceReviewResponse)
@@ -422,7 +439,10 @@ async def submit_manager_evaluation(
     """
     stmt = (
         select(PerformanceReview)
-        .options(selectinload(PerformanceReview.reviewee))
+        .options(
+            selectinload(PerformanceReview.reviewee),
+            selectinload(PerformanceReview.reviewer),
+        )
         .where(PerformanceReview.id == review_id)
     )
     res = await db.execute(stmt)
@@ -444,8 +464,18 @@ async def submit_manager_evaluation(
     review.manager_score = payload.manager_score
     review.feedback = payload.feedback
     await db.commit()
-    await db.refresh(review)
-    return review
+
+    # Re-fetch with relationships eagerly loaded
+    reload_stmt = (
+        select(PerformanceReview)
+        .options(
+            selectinload(PerformanceReview.reviewee),
+            selectinload(PerformanceReview.reviewer),
+        )
+        .where(PerformanceReview.id == review_id)
+    )
+    reloaded = (await db.execute(reload_stmt)).scalar_one()
+    return reloaded
 
 
 @router.post("/reviews/{review_id}/finalize", response_model=PerformanceReviewResponse)
@@ -463,7 +493,14 @@ async def finalize_performance_review(
             detail="Forbidden: Only HR or Admins possess authority to finalize performance reviews.",
         )
 
-    stmt = select(PerformanceReview).where(PerformanceReview.id == review_id)
+    stmt = (
+        select(PerformanceReview)
+        .options(
+            selectinload(PerformanceReview.reviewee),
+            selectinload(PerformanceReview.reviewer),
+        )
+        .where(PerformanceReview.id == review_id)
+    )
     res = await db.execute(stmt)
     review = res.scalar_one_or_none()
     if not review:
@@ -479,5 +516,15 @@ async def finalize_performance_review(
     review.finalized_by = current_user.id
     review.finalized_at = datetime.now(timezone.utc)
     await db.commit()
-    await db.refresh(review)
-    return review
+
+    # Re-fetch with relationships eagerly loaded
+    reload_stmt = (
+        select(PerformanceReview)
+        .options(
+            selectinload(PerformanceReview.reviewee),
+            selectinload(PerformanceReview.reviewer),
+        )
+        .where(PerformanceReview.id == review_id)
+    )
+    reloaded = (await db.execute(reload_stmt)).scalar_one()
+    return reloaded
