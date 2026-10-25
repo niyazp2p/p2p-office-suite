@@ -1,7 +1,7 @@
 import calendar
 import io
 import uuid
-from datetime import date
+from datetime import date as py_date
 from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from redis.asyncio import Redis
@@ -12,18 +12,33 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.core.redis import get_redis
-from app.models.audit import AuditAction, AuditLog
-from app.models.financials import PayrollItem, PayrollRecord
+from app.models.audit import AuditAction
+from app.models.financials import (
+    EMIStatus,
+    EmployeeLoan,
+    LoanEMI,
+    LoanStatus,
+    PayrollItem,
+    PayrollRecord,
+)
 from app.models.timesheet import Timesheet
 from app.models.user import RoleEnum, User
 from app.schemas.financials import (
     AuditLogResponse,
+    CustomEMIScheduleItem,
+    EmployeeLoanResponse,
+    LoanCreateRequest,
+    LoanEMIResponse,
     PayrollBatchResponse,
     PayrollCalculateRequest,
     PayrollRecordCreateOrUpdate,
     PayrollRecordResponse,
 )
 from app.services.audit_service import log_audit_event
+from app.services.loan_service import (
+    create_employee_loan_with_schedule,
+    process_loan_deductions_for_cycle,
+)
 
 router = APIRouter()
 
@@ -39,10 +54,6 @@ async def get_payroll_profile(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> PayrollRecordResponse:
-    """
-    Employees can view their own profile.
-    HR, Admin, and Superadmin can view any employee's compensation terms.
-    """
     if current_user.id != user_id and current_user.role not in HR_ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -71,16 +82,12 @@ async def set_or_update_payroll_profile(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> PayrollRecordResponse:
-    """
-    Only HR, Admin, or Superadmin can configure employee compensation packages.
-    """
     if current_user.role not in HR_ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Forbidden: Only HR or Admins can configure compensation terms.",
         )
 
-    # Validate target user exists
     user_res = await db.execute(select(User).where(User.id == user_id))
     if not user_res.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Target employee not found.")
@@ -118,7 +125,101 @@ async def set_or_update_payroll_profile(
 
 
 # -----------------------------------------------------------------------------
-# 2. Automated Payroll Calculation Engine with Redis Idempotency Lock
+# 2. Advance Salary, Loans & Custom EMI System
+# -----------------------------------------------------------------------------
+@router.post("/loans", response_model=EmployeeLoanResponse, status_code=status.HTTP_201_CREATED)
+async def create_loan_or_advance(
+    payload: LoanCreateRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> EmployeeLoanResponse:
+    """
+    Grants an advance salary or company loan with custom EMI schedule.
+    Restricted to HR, Admin, Superadmin.
+    """
+    if current_user.role not in HR_ADMIN_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Only HR or Admins can disburse salary advances and loans.",
+        )
+
+    target_user = await db.get(User, payload.user_id)
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Target employee not found.")
+
+    loan = await create_employee_loan_with_schedule(
+        payload=payload,
+        approver_id=current_user.id,
+        db=db,
+    )
+    return loan
+
+
+@router.get("/loans", response_model=list[EmployeeLoanResponse])
+async def list_loans(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user_id: uuid.UUID | None = None,
+    loan_status: LoanStatus | None = None,
+) -> list[EmployeeLoanResponse]:
+    """
+    View loan/advance salary records.
+    Employees see only their own; HR/Admin see company-wide records.
+    """
+    stmt = (
+        select(EmployeeLoan)
+        .options(selectinload(EmployeeLoan.emis), selectinload(EmployeeLoan.user))
+        .order_by(EmployeeLoan.created_at.desc())
+    )
+
+    if current_user.role not in HR_ADMIN_ROLES:
+        stmt = stmt.where(EmployeeLoan.user_id == current_user.id)
+    elif user_id:
+        stmt = stmt.where(EmployeeLoan.user_id == user_id)
+
+    if loan_status:
+        stmt = stmt.where(EmployeeLoan.status == loan_status)
+
+    res = await db.execute(stmt)
+    return list(res.scalars().all())
+
+
+@router.patch("/loans/emis/{emi_id}", response_model=LoanEMIResponse)
+async def update_custom_emi_date(
+    emi_id: uuid.UUID,
+    new_date: py_date | None = None,
+    new_amount: float | None = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_db)] = None,
+) -> LoanEMIResponse:
+    """
+    Allows HR/Admin to reschedule an EMI or adjust the amount before deduction.
+    """
+    if current_user.role not in HR_ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="Forbidden: Only HR can modify EMI schedules.")
+
+    emi = await db.get(LoanEMI, emi_id)
+    if not emi:
+        raise HTTPException(status_code=404, detail="EMI record not found.")
+
+    if emi.status == EMIStatus.PAID:
+        raise HTTPException(status_code=400, detail="Cannot alter an already paid EMI installment.")
+
+    if new_date:
+        emi.custom_deduction_date = new_date
+        emi.deduction_year = new_date.year
+        emi.deduction_month = new_date.month
+
+    if new_amount is not None:
+        emi.amount = new_amount
+
+    await db.commit()
+    await db.refresh(emi)
+    return emi
+
+
+# -----------------------------------------------------------------------------
+# 3. Automated Payroll Calculation Engine with EMI Deductions & Zero Tax
 # -----------------------------------------------------------------------------
 @router.post("/payroll/calculate", response_model=PayrollBatchResponse)
 async def calculate_monthly_payroll(
@@ -129,11 +230,9 @@ async def calculate_monthly_payroll(
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
 ) -> PayrollBatchResponse:
     """
-    Calculates monthly payroll across all active employees.
-    Locks execution via Redis (TTL = 60s) if an Idempotency-Key header is supplied.
-    Formula:
-      Gross = Base + (Approved Timesheet Hours * Hourly Rate) + Bonus
-      Net = Gross - [(Gross * Tax Rate / 100) + Health Deduction]
+    Computes monthly payroll across all active employees.
+    Gross Pay = Base + (Approved Hours * Hourly Rate) + Bonus
+    Net Pay = Gross Pay - Active EMI Deductions
     """
     if current_user.role not in HR_ADMIN_ROLES:
         raise HTTPException(
@@ -141,7 +240,6 @@ async def calculate_monthly_payroll(
             detail="Forbidden: Insufficient authority to execute company-wide payroll calculations.",
         )
 
-    # Redis Idempotency Lock
     if idempotency_key:
         lock_acquired = await redis.set(
             f"idemp_payroll_{idempotency_key}", "locked", nx=True, ex=60
@@ -153,11 +251,10 @@ async def calculate_monthly_payroll(
             )
 
     batch_id = uuid.uuid4()
-    start_date = date(payload.year, payload.month, 1)
+    start_date = py_date(payload.year, payload.month, 1)
     end_day = calendar.monthrange(payload.year, payload.month)[1]
-    end_date = date(payload.year, payload.month, end_day)
+    end_date = py_date(payload.year, payload.month, end_day)
 
-    # Fetch active employees with configured compensation profiles
     profiles_stmt = (
         select(PayrollRecord)
         .options(selectinload(PayrollRecord.user))
@@ -169,10 +266,9 @@ async def calculate_monthly_payroll(
     items: list[PayrollItem] = []
     total_gross = 0.0
     total_net = 0.0
-    total_tax = 0.0
+    total_emi_collected = 0.0
 
     for prof in profiles:
-        # Sum approved timesheet hours in the calendar month
         ts_stmt = select(func.coalesce(func.sum(Timesheet.hours_spent), 0.0)).where(
             Timesheet.user_id == prof.user_id,
             Timesheet.is_approved.is_(True),
@@ -183,12 +279,22 @@ async def calculate_monthly_payroll(
 
         bonus_amt = float(payload.bonuses.get(prof.user_id, 0.0))
         hourly_earnings = approved_hrs * prof.hourly_rate
+
+        # 1. Gross Salary = Base + Hourly + Bonus
         gross = prof.base_salary + hourly_earnings + bonus_amt
 
-        tax_amt = gross * (prof.tax_rate_percent / 100.0)
-        net = max(0.0, gross - (tax_amt + prof.health_deduction))
+        # 2. Collect EMI / Advance deductions for this specific month
+        loan_deduction = await process_loan_deductions_for_cycle(
+            user_id=prof.user_id,
+            year=payload.year,
+            month=payload.month,
+            batch_id=batch_id,
+            db=db,
+        )
 
-        # Check existing item to avoid unique constraint conflict on re-run
+        # 3. Net Salary = Gross Salary - Loan EMI (Zero Tax / Zero Health)
+        net = max(0.0, gross - loan_deduction)
+
         existing_stmt = select(PayrollItem).where(
             PayrollItem.user_id == prof.user_id,
             PayrollItem.year == payload.year,
@@ -211,13 +317,14 @@ async def calculate_monthly_payroll(
         item.hourly_pay = round(hourly_earnings, 2)
         item.bonus = round(bonus_amt, 2)
         item.gross_pay = round(gross, 2)
-        item.tax_deduction = round(tax_amt, 2)
-        item.health_deduction = round(prof.health_deduction, 2)
+        item.loan_deduction = round(loan_deduction, 2)
+        item.tax_deduction = 0.0
+        item.health_deduction = 0.0
         item.net_pay = round(net, 2)
 
         total_gross += gross
         total_net += net
-        total_tax += tax_amt
+        total_emi_collected += loan_deduction
         items.append(item)
 
     await db.flush()
@@ -232,12 +339,12 @@ async def calculate_monthly_payroll(
             "month": payload.month,
             "records": len(items),
             "total_gross": round(total_gross, 2),
+            "total_emi_collected": round(total_emi_collected, 2),
             "total_net": round(total_net, 2),
         },
     )
     await db.commit()
 
-    # Query with eager-loaded user associations
     result_stmt = (
         select(PayrollItem)
         .options(selectinload(PayrollItem.user))
@@ -250,15 +357,15 @@ async def calculate_monthly_payroll(
         year=payload.year,
         month=payload.month,
         total_gross_disbursed=round(total_gross, 2),
+        total_loan_deductions_collected=round(total_emi_collected, 2),
         total_net_disbursed=round(total_net, 2),
-        total_tax_withheld=round(total_tax, 2),
         records_processed=len(computed_items),
         items=list(computed_items),
     )
 
 
 # -----------------------------------------------------------------------------
-# 3. CSV Payslip Export Streamer
+# 4. CSV Payslip Export Streamer (With Loans & Zero Tax)
 # -----------------------------------------------------------------------------
 @router.get("/payroll/export")
 async def export_payroll_csv(
@@ -267,9 +374,6 @@ async def export_payroll_csv(
     current_user: Annotated[User, Depends(get_current_user)] = None,
     db: Annotated[AsyncSession, Depends(get_db)] = None,
 ) -> Response:
-    """
-    Streams a CSV export of the payroll breakdown for accounting.
-    """
     if current_user.role not in HR_ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -286,7 +390,7 @@ async def export_payroll_csv(
 
     output = io.StringIO()
     output.write(
-        "Employee Code,Full Name,Email,Department,Year,Month,Approved Hours,Base Pay,Hourly Pay,Bonus,Gross Pay,Tax Deduction,Health Deduction,Net Pay\n"
+        "Employee Code,Full Name,Email,Department,Year,Month,Approved Hours,Base Pay,Hourly Pay,Bonus,Gross Pay,Loan EMI Deduction,Net Pay\n"
     )
 
     for i in items:
@@ -294,7 +398,7 @@ async def export_payroll_csv(
         output.write(
             f'"{u.employee_code}","{u.first_name} {u.last_name}","{u.email}","{u.department}",'
             f"{i.year},{i.month},{i.approved_hours:.2f},{i.base_pay:.2f},{i.hourly_pay:.2f},"
-            f"{i.bonus:.2f},{i.gross_pay:.2f},{i.tax_deduction:.2f},{i.health_deduction:.2f},{i.net_pay:.2f}\n"
+            f"{i.bonus:.2f},{i.gross_pay:.2f},{i.loan_deduction:.2f},{i.net_pay:.2f}\n"
         )
 
     return Response(
@@ -307,7 +411,7 @@ async def export_payroll_csv(
 
 
 # -----------------------------------------------------------------------------
-# 4. Immutable Audit Logs Endpoint
+# 5. Immutable Audit Logs Endpoint
 # -----------------------------------------------------------------------------
 @router.get("/audit-logs", response_model=list[AuditLogResponse])
 async def list_audit_logs(
@@ -318,9 +422,6 @@ async def list_audit_logs(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
 ) -> list[AuditLogResponse]:
-    """
-    Superadmins and Admins can query system audit logs.
-    """
     if current_user.role not in {RoleEnum.SUPERADMIN, RoleEnum.ADMIN}:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

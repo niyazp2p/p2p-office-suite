@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date as py_date, datetime
 from pydantic import BaseModel, ConfigDict, Field
 from app.models.audit import AuditAction
+from app.models.financials import EMIStatus, LoanStatus
 from app.schemas.user import UserResponse
 
 
 class PayrollRecordBase(BaseModel):
     base_salary: float = Field(default=0.0, ge=0.0)
     hourly_rate: float = Field(default=0.0, ge=0.0)
-    tax_rate_percent: float = Field(default=10.0, ge=0.0, le=100.0)
+    tax_rate_percent: float = Field(default=0.0, ge=0.0, le=100.0)
     health_deduction: float = Field(default=0.0, ge=0.0)
     is_active: bool = True
 
@@ -29,6 +30,60 @@ class PayrollRecordResponse(PayrollRecordBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+# --- Loan & Custom EMI Schemas ---
+class CustomEMIScheduleItem(BaseModel):
+    deduction_year: int = Field(..., ge=2020, le=2100)
+    deduction_month: int = Field(..., ge=1, le=12)
+    amount: float = Field(..., gt=0.0)
+    custom_deduction_date: py_date | None = None
+
+
+class LoanCreateRequest(BaseModel):
+    user_id: uuid.UUID
+    total_amount: float = Field(..., gt=0.0)
+    total_installments: int = Field(..., ge=1, le=60)
+    reason: str | None = None
+    start_year: int = Field(default=2026, ge=2020, le=2100)
+    start_month: int = Field(default=11, ge=1, le=12)
+    custom_schedule: list[CustomEMIScheduleItem] | None = Field(
+        default=None,
+        description="Optional list of specific custom EMI dates and amounts. If omitted, installment amounts divide equally.",
+    )
+
+
+class LoanEMIResponse(BaseModel):
+    id: uuid.UUID
+    loan_id: uuid.UUID
+    installment_number: int
+    deduction_year: int
+    deduction_month: int
+    custom_deduction_date: py_date | None = None
+    amount: float
+    status: EMIStatus
+    paid_at: datetime | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class EmployeeLoanResponse(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    total_amount: float
+    total_installments: int
+    remaining_balance: float
+    reason: str | None = None
+    status: LoanStatus
+    approved_by: uuid.UUID | None = None
+    disbursed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    emis: list[LoanEMIResponse] = []
+    user: UserResponse | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --- Payroll Calculation & Output Schemas ---
 class PayrollCalculateRequest(BaseModel):
     year: int = Field(default=2026, ge=2020, le=2100)
     month: int = Field(default=10, ge=1, le=12)
@@ -49,6 +104,7 @@ class PayrollItemResponse(BaseModel):
     hourly_pay: float
     bonus: float
     gross_pay: float
+    loan_deduction: float
     tax_deduction: float
     health_deduction: float
     net_pay: float
@@ -63,8 +119,8 @@ class PayrollBatchResponse(BaseModel):
     year: int
     month: int
     total_gross_disbursed: float
+    total_loan_deductions_collected: float
     total_net_disbursed: float
-    total_tax_withheld: float
     records_processed: int
     items: list[PayrollItemResponse]
 
