@@ -55,13 +55,15 @@ PERMITTED_ROLES_TO_PROVISION: dict[RoleEnum, set[RoleEnum]] = {
 
 def assert_can_create_role(creator_role: RoleEnum, target_role: RoleEnum) -> None:
     """Enforces role creation permissions strictly according to security policy."""
-    allowed = PERMITTED_ROLES_TO_PROVISION.get(creator_role, set())
-    if target_role not in allowed:
+    c_role = RoleEnum(creator_role) if isinstance(creator_role, str) else creator_role
+    t_role = RoleEnum(target_role) if isinstance(target_role, str) else target_role
+    allowed = PERMITTED_ROLES_TO_PROVISION.get(c_role, set())
+    if t_role not in allowed:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
-                f"Forbidden: Role '{creator_role.value}' does not possess "
-                f"authorization to instantiate role '{target_role.value}'."
+                f"Forbidden: Role '{c_role.value}' does not possess "
+                f"authorization to instantiate role '{t_role.value}'."
             ),
         )
 
@@ -80,24 +82,35 @@ async def get_current_user(
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
         token_data = TokenPayload(**payload)
-    except JWTError:
+    except (JWTError, Exception):
         raise credentials_exception
 
     # Check revocation blacklist in Redis
-    if await is_token_blacklisted(redis, token_data.jti):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has been revoked",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    try:
+        if await is_token_blacklisted(redis, token_data.jti):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    except Exception:
+        # If Redis is temporarily unreachable, do not crash with 500
+        pass
 
     try:
-        user_uuid = uuid.UUID(token_data.sub)
-    except ValueError:
+        user_uuid = uuid.UUID(str(token_data.sub))
+    except (ValueError, TypeError):
         raise credentials_exception
 
-    result = await db.execute(select(User).where(User.id == user_uuid))
-    user = result.scalar_one_or_none()
+    try:
+        result = await db.execute(select(User).where(User.id == user_uuid))
+        user = result.scalar_one_or_none()
+    except Exception as e:
+        # Prevents unhandled DB driver crashes from producing raw 500s without explanation
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database user lookup failed: {str(e)}",
+        )
 
     if not user or not user.is_active:
         raise HTTPException(
